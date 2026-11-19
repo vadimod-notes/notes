@@ -97,7 +97,7 @@
 
   function api(action, payload) {
     var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 30000) : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 60000) : null;
     return fetch(CFG.API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -112,13 +112,18 @@
         return j.data;
       }, function (err) {
         if (timer) clearTimeout(timer);
-        if (err && err.code) throw err;
-        var e = new Error('network'); e.code = 'network'; throw e;
+        // ошибки браузера (AbortError = код 20, TypeError «Load failed») — это обрыв связи, а не ответ сервера
+        if (err && typeof err.code === 'string') throw err;
+        var e = new Error('network');
+        e.code = err && err.name === 'AbortError' ? 'timeout' : 'network';
+        throw e;
       });
   }
 
   var ERRORS = {
     network: 'Нет связи с таблицей. Проверьте интернет.',
+    timeout: 'Таблица долго не отвечает. Попробуйте ещё раз — дубля не будет.',
+    busy: 'Таблица занята, попробуйте через пару секунд',
     locked: 'Слишком много неверных попыток. Подождите 10 минут.',
     bad_amount: 'Проверьте сумму',
     bad_date: 'Проверьте дату',
@@ -128,6 +133,26 @@
     bad_rate: 'Проверьте ставку'
   };
   function errText(e) { return ERRORS[e.code] || ('Ошибка: ' + (e.code || e.message)); }
+  function isLinkError(e) { return e && (e.code === 'network' || e.code === 'timeout'); }
+
+  /** Короткий случайный ID: создаётся на телефоне, поэтому повторная отправка не создаёт дубль. */
+  function uid() {
+    var a = new Uint8Array(6);
+    (window.crypto || window.msCrypto).getRandomValues(a);
+    return Array.prototype.map.call(a, function (b) { return (b < 16 ? '0' : '') + b.toString(16); }).join('');
+  }
+
+  /** Тихо подтянуть свежие данные из таблицы (без экрана загрузки). */
+  function silentReload() {
+    return api('load').then(function (d) {
+      d.transactions.forEach(function (t) { t.amount = Number(t.amount) || 0; });
+      S.data = d;
+      S.lastLoad = Date.now();
+      sortTxs();
+      if (!document.getElementById('sheet-root') && !SC) render();
+      return d;
+    });
+  }
 
   // ───────────── запуск ─────────────
 
@@ -145,6 +170,7 @@
     api('load').then(function (d) {
       d.transactions.forEach(function (t) { t.amount = Number(t.amount) || 0; });
       S.data = d;
+      S.lastLoad = Date.now();
       sortTxs();
       render();
     }).catch(function (e) {
@@ -429,6 +455,7 @@
 
   function openTx(type, accountId, categoryId) {
     T = {
+      id: uid(),
       type: type, account_id: accountId, category_id: categoryId,
       amount: '0', who: S.me || S.data.people[0], date: C.toDateTimeStr(new Date()),
       comment: '', qr: '', scanned: false, picker: null, saving: false
@@ -542,23 +569,39 @@
     T.saving = true;
     setSheet(txHtml());
     var payload = {
-      type: T.type, amount: C.amountFromInput(T.amount), account_id: T.account_id, category_id: T.category_id,
+      id: T.id, type: T.type, amount: C.amountFromInput(T.amount), account_id: T.account_id, category_id: T.category_id,
       who: T.who, date: T.date, comment: T.comment.trim(), qr: T.qr, force: !!force
     };
-    api('addTx', payload).then(function (row) {
+    var mine = T;
+    function done(row) {
       row.amount = Number(row.amount);
-      S.data.transactions.push(row);
+      if (!byId(S.data.transactions, row.id)) S.data.transactions.push(row);
       sortTxs();
-      safeSet(LS_ACC, T.account_id);
-      T = null;
-      closeSheet();
+      safeSet(LS_ACC, mine.account_id);
+      if (T === mine) { T = null; closeSheet(); }
       if (S.view === 'add') S.view = S.prevView;
       S.month = C.monthKey(row.date);
       render();
       toast(row.type === 'income' ? 'Доход сохранён' : 'Расход сохранён');
-    }).catch(function (e) {
-      T.saving = false;
-      setSheet(txHtml());
+    }
+    api('addTx', payload).then(done).catch(function (e) {
+      if (isLinkError(e)) {
+        // Связь оборвалась — но таблица могла успеть записать. Проверяем по ID.
+        toast('Связь оборвалась, проверяем, сохранилось ли…');
+        return silentReload().then(function () {
+          var row = byId(S.data.transactions, mine.id);
+          if (row) return done(row);
+          mine.saving = false;
+          if (T === mine) setSheet(txHtml());
+          toast('Не сохранилось. Нажмите «Сохранить» ещё раз');
+        }, function () {
+          mine.saving = false;
+          if (T === mine) setSheet(txHtml());
+          toast(errText(e));
+        });
+      }
+      mine.saving = false;
+      if (T === mine) setSheet(txHtml());
       if (e.code === 'duplicate_receipt') {
         if (window.confirm('Этот чек уже добавлен. Добавить ещё раз?')) saveTx(true);
       } else toast(errText(e));
@@ -735,7 +778,7 @@
     }).catch(function (e) {
       F.saving = false;
       setSheet(formHtml());
-      toast(errText(e));
+      toast(isLinkError(e) ? 'Связь оборвалась. Нажмите «Сохранить» ещё раз — дубля не будет' : errText(e));
     });
   }
 
@@ -746,6 +789,7 @@
 
   function categoryForm(kind, id) {
     var c = id ? cat(id) : null;
+    var newId = uid();
     kind = c ? c.kind : kind;
     var fields = [{ key: 'name', label: 'Название', type: 'text', placeholder: kind === 'income' ? 'Например, Кэшбэк' : 'Например, Питомцы' },
       { key: 'icon', type: 'icons', set: kind }];
@@ -763,7 +807,7 @@
       },
       save: function (v) {
         var row = {
-          id: c ? c.id : '', kind: kind, name: v.name, icon: v.icon, color: kind === 'income' ? '#141414' : v.color,
+          id: c ? c.id : newId, kind: kind, name: v.name, icon: v.icon, color: kind === 'income' ? '#141414' : v.color,
           limit: kind === 'expense' ? num(v.limit) : 0, sort: c ? c.sort : 0, archived: false
         };
         return api('saveCategory', row).then(function (saved) { upsertLocal(S.data.categories, saved); return 'Сохранено'; });
@@ -781,6 +825,7 @@
 
   function accountForm(id) {
     var a = id ? acc(id) : null;
+    var newId = uid();
     var effect = a ? C.accountBalance(a, txs()) - (Number(a.start_balance) || 0) : 0;
     openForm({
       title: a ? 'Счёт' : 'Новый счёт',
@@ -791,7 +836,7 @@
       ],
       values: { name: a ? a.name : '', icon: a ? a.icon : 'card', balance: a ? C.fmtMoney(C.accountBalance(a, txs())) : '' },
       save: function (v) {
-        var row = { id: a ? a.id : '', name: v.name, icon: v.icon, start_balance: Math.round((num(v.balance) - effect) * 100) / 100, sort: a ? a.sort : 0, archived: false };
+        var row = { id: a ? a.id : newId, name: v.name, icon: v.icon, start_balance: Math.round((num(v.balance) - effect) * 100) / 100, sort: a ? a.sort : 0, archived: false };
         return api('saveAccount', row).then(function (saved) { upsertLocal(S.data.accounts, saved); return 'Сохранено'; });
       },
       extra: a ? {
@@ -806,6 +851,7 @@
 
   function depositForm(id) {
     var d = id ? byId(S.data.deposits, id) : null;
+    var newId = uid();
     openForm({
       title: d ? 'Вклад' : 'Новый вклад',
       fields: [
@@ -823,7 +869,7 @@
       },
       save: function (v) {
         var row = {
-          id: d ? d.id : '', name: v.name, principal: num(v.principal), rate: num(v.rate),
+          id: d ? d.id : newId, name: v.name, principal: num(v.principal), rate: num(v.rate),
           start_date: v.start_date, term_months: Math.round(num(v.term_months)), capitalization: v.capitalization, archived: false
         };
         return api('saveDeposit', row).then(function (saved) { upsertLocal(S.data.deposits, saved); return 'Сохранено'; });
@@ -944,7 +990,10 @@
         S.data.transactions = txs().filter(function (x) { return x.id !== t.id; });
         render();
         toast('Операция удалена');
-      }).catch(function (e) { toast(errText(e)); });
+      }).catch(function (e) {
+        toast(errText(e));
+        if (isLinkError(e)) silentReload().catch(function () {});
+      });
     },
     'logout': function () {
       if (!window.confirm('Выйти на этом телефоне? Чтобы войти снова, понадобится код доступа.')) return;
@@ -1010,6 +1059,14 @@
     }
     if (k === 'f' && F) F.values[e.target.getAttribute('data-k')] = e.target.value;
   });
+  // Вернулись в приложение — подтягиваем изменения второго человека
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible' || !S.data || !S.key) return;
+    if (Date.now() - (S.lastLoad || 0) < 20000) return;
+    if (document.getElementById('sheet-root') || SC) return;
+    silentReload().catch(function () {});
+  });
+
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && e.target.id === 'key') doLogin();
   });
