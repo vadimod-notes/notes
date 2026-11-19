@@ -898,6 +898,33 @@
     var srcObj = src.kind === 'acc' ? acc(src.id) : cat(src.id);
     var want = src.kind === 'income' ? 'acc' : 'cat';
     var sx = e.clientX, sy = e.clientY, started = false, coin = null, over = null;
+    var lastX = sx, lastY = sy, raf = 0;
+    var scroller = app.querySelector('.screen');
+
+    // Автопрокрутка: палец у верхнего/нижнего края — страница едет сама
+    function autoScroll() {
+      if (!started) return;
+      if (scroller) {
+        var r = scroller.getBoundingClientRect();
+        var zone = Math.min(110, r.height / 4), max = 16, dy = 0;
+        if (lastY > r.bottom - zone) dy = max * Math.min(1, (lastY - (r.bottom - zone)) / zone);
+        else if (lastY < r.top + zone) dy = -max * Math.min(1, ((r.top + zone) - lastY) / zone);
+        if (dy) {
+          var before = scroller.scrollTop;
+          scroller.scrollTop = before + dy;
+          if (scroller.scrollTop !== before) updateOver();
+        }
+      }
+      raf = requestAnimationFrame(autoScroll);
+    }
+    function updateOver() {
+      var t = hit(lastX, lastY);
+      if (t !== over) {
+        if (over) over.classList.remove('is-over');
+        over = t;
+        if (over) over.classList.add('is-over');
+      }
+    }
 
     function place(x, y) { coin.style.left = x + 'px'; coin.style.top = y + 'px'; }
     function begin(x, y) {
@@ -912,6 +939,7 @@
       var dim = src.kind === 'acc' ? ['income', 'acc'] : ['income', 'cat'];
       dim.forEach(function (s) { var c = app.querySelector('[data-sec="' + s + '"]'); if (c) c.classList.add('dim'); });
       if (navigator.vibrate) navigator.vibrate(10);
+      raf = requestAnimationFrame(autoScroll);
     }
     function hit(x, y) {
       var t = document.elementFromPoint(x, y);
@@ -927,16 +955,13 @@
         begin(ev.clientX, ev.clientY);
       }
       if (ev.cancelable) ev.preventDefault();
-      place(ev.clientX, ev.clientY);
-      var t = hit(ev.clientX, ev.clientY);
-      if (t !== over) {
-        if (over) over.classList.remove('is-over');
-        over = t;
-        if (over) over.classList.add('is-over');
-      }
+      lastX = ev.clientX; lastY = ev.clientY;
+      place(lastX, lastY);
+      updateOver();
     }
     function end(ev, cancelled) {
       clearTimeout(timer);
+      cancelAnimationFrame(raf);
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
       window.removeEventListener('pointercancel', cancel);
